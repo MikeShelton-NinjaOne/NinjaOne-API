@@ -233,4 +233,3 @@ That's the same entry the script created and that the blog post warns not to mod
 
 - `Set-NinjaWebhook.ps1` — the script
 - `README.md` — this walkthrough
-- `PROMPT.md` — the prompt used to generate all of this, for clean regeneration

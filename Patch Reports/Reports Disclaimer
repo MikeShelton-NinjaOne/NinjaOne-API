@@ -1,0 +1,4 @@
+Patch Reports
+
+This folder contains scripts for generating and working with patch reports — useful for getting visibility into patch status, compliance, and reporting across your environment.
+Reminder: These scripts aren't officially supported by NinjaOne. NinjaOne Support won't be able to help troubleshoot if something goes sideways, so test in a safe environment first and use at your own risk. PRs welcome if you've got improvements or new report types to add.

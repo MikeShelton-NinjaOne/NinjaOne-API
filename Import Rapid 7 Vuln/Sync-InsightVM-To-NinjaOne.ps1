@@ -170,19 +170,43 @@ function Invoke-InsightVMSearch {
     $headers = Get-InsightVMHeaders
     $allRecords = @()
     $cursor = $null
+    $previousCursor = $null
     $pageSize = 500
+    $pageNumber = 0
 
     do {
+        $pageNumber++
         $url = "$InsightVMBaseURL/$Path`?size=$pageSize"
         if ($ExtraQuery) { $url += "&$ExtraQuery" }
         if ($cursor)     { $url += "&cursor=" + [uri]::EscapeDataString($cursor) }
 
-        $response = Invoke-RestMethod -Uri $url -Headers $headers -Method Post -Body "{}"
+        $timer = [System.Diagnostics.Stopwatch]::StartNew()
+        # 120-second limit per request so a stalled call fails loudly instead of
+        # hanging for hours.
+        $response = Invoke-RestMethod -Uri $url -Headers $headers -Method Post -Body "{}" -TimeoutSec 120
+        $timer.Stop()
 
         $records = @($response.data) | Where-Object { $null -ne $_ }
         $allRecords += $records
+        $previousCursor = $cursor
         $cursor = $response.metadata.cursor
-    } while ($records.Count -gt 0 -and $cursor)
+
+        # Log what Rapid7 actually sent back, so an empty result can be explained.
+        $totalResources = $response.metadata.totalResources
+        $totalPages     = $response.metadata.totalPages
+        Write-Log ("  [{0}] page {1}: {2} records returned in {3:N1}s (Rapid7 reports totalResources={4}, totalPages={5}, more pages: {6})" -f $Path, $pageNumber, @($records).Count, $timer.Elapsed.TotalSeconds, $(if ($null -ne $totalResources) { $totalResources } else { "not reported" }), $(if ($null -ne $totalPages) { $totalPages } else { "not reported" }), $(if ($cursor) { "yes" } else { "no" }))
+
+        if (@($records).Count -eq 0 -and $pageNumber -eq 1) {
+            # First page empty: show the shape of the response to help diagnose why.
+            $topLevelNames = ($response.PSObject.Properties.Name) -join ", "
+            Write-Log "  [$Path] First page was empty. The response contained these top-level fields: $topLevelNames"
+        }
+
+        if ($cursor -and $cursor -eq $previousCursor) {
+            Write-Log "  [$Path] Rapid7 returned the same cursor twice - stopping paging to avoid an endless loop."
+            break
+        }
+    } while (@($records).Count -gt 0 -and $cursor)
 
     return $allRecords
 }
@@ -254,17 +278,30 @@ try {
     # --- Step 1: Pull assets and their vulnerability findings from InsightVM ---
     Write-Log "Connecting to Rapid7 (region: $Rapid7Region) and retrieving asset list..."
     try {
-        $assets = Get-InsightVMAssets
+        Write-Log "Requesting assets from Rapid7..."
+        $assets = @(Get-InsightVMAssets)
+        Write-Log "Requesting vulnerability definitions from Rapid7..."
         Initialize-InsightVMVulnerabilityDetails
+        Write-Log "Loaded $($script:VulnDetailCache.Count) vulnerability definitions."
     }
     catch {
         Write-Log "COULD NOT CONNECT TO RAPID7. Things to check: is the Rapid7 region correct for your account, is the API key correct and still valid, and does the key's user have permission to read asset data? Details: $($_.Exception.Message)"
         throw
     }
     Write-Log "Found $($assets.Count) assets in InsightVM."
+    if ($assets.Count -eq 0) {
+        Write-Log "Rapid7 accepted the request but returned no assets. Check the page lines above: if Rapid7 reports totalResources=0, the API key's user can see no assets (or this account has no data in the cloud API). If totalResources is above 0, the response shape differs from what this script expects."
+    }
 
     $rows = @()
     $totalRawFindings = 0
+
+    # Counters so the log can explain where findings were dropped.
+    $skippedNoDeviceId     = 0
+    $assetsWithNoFindings  = 0
+    $findingsNoDefinition  = 0
+    $findingsBelowSeverity = 0
+    $findingsNoCve         = 0
 
     foreach ($asset in $assets) {
 
@@ -279,23 +316,26 @@ try {
         if ([string]::IsNullOrWhiteSpace($deviceId)) {
             # Skip assets that don't have the identifier you chose - there's nothing
             # useful to send NinjaOne for a device we can't identify.
+            $skippedNoDeviceId++
             continue
         }
 
         # The asset already carries its findings. "new" and "same" are the findings
         # that are currently present; "remediated" (already fixed) is left out.
-        $findings = @($asset.new) + @($asset.same) | Where-Object { $null -ne $_ }
+        $findings = @(@($asset.new) + @($asset.same) | Where-Object { $null -ne $_ })
         $totalRawFindings += $findings.Count
+        if ($findings.Count -eq 0) { $assetsWithNoFindings++ }
 
         foreach ($finding in $findings) {
             $detail = $script:VulnDetailCache[[string]$finding.vulnerability_id]
-            if (-not $detail) { continue }
+            if (-not $detail) { $findingsNoDefinition++; continue }
 
             $severity = $detail.cvss_v3_score
             if (-not $severity) { $severity = $detail.cvss_v2_score }
             if (-not $severity) { $severity = 0 }
 
             if ([double]$severity -lt $MinimumCVSSSeverity) {
+                $findingsBelowSeverity++
                 continue
             }
 
@@ -314,6 +354,7 @@ try {
                 # Some vulnerabilities in InsightVM don't have a CVE assigned at all
                 # (e.g. vendor-specific advisories) - skip those since NinjaOne's
                 # importer is expecting a CVE ID.
+                $findingsNoCve++
                 continue
             }
 
@@ -328,6 +369,7 @@ try {
     }
 
     Write-Log "Pulled $totalRawFindings raw findings from InsightVM. $($rows.Count) rows remain after applying your severity filter ($MinimumCVSSSeverity+) and removing entries without a CVE ID or device identifier."
+    Write-Log "Where things were dropped: $skippedNoDeviceId assets had no $DeviceIdField value; $assetsWithNoFindings assets had no current findings; $findingsNoDefinition findings had no matching vulnerability definition; $findingsBelowSeverity findings were below the severity filter; $findingsNoCve findings had no CVE ID."
 
     if ($rows.Count -eq 0) {
         Write-Log "No qualifying CVEs found - nothing to upload this run. Ending."

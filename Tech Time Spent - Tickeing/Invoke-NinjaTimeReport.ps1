@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     Generates an interactive HTML report showing how much time each technician has
@@ -76,6 +76,11 @@ $LookbackDays    = 90
 # The name of the Knowledge Base article that will be created/updated
 $KbArticleName   = 'Technician Time Report'
 
+# The ID of the ticket board to read tickets from.
+# 2 is NinjaOne's built-in "All tickets" board. To confirm it in your tenant, open
+# Ticketing > Boards and check the board named "All tickets".
+$TicketBoardId   = 2
+
 # ==============================================================================
 #  DO NOT EDIT BELOW THIS LINE
 # ==============================================================================
@@ -130,6 +135,41 @@ function Invoke-NinjaApi {
     }
 }
 
+# ── Helpers: safe property access and timestamp conversion ───────────────────
+# Strict mode makes reading a property that does not exist an error, so every API
+# field is read through Get-Prop, which returns a default instead.
+function Get-Prop {
+    param($Obj, [string]$Name, $Default = $null)
+    if ($null -eq $Obj) { return $Default }
+    $p = $Obj.PSObject.Properties[$Name]
+    if ($p -and $null -ne $p.Value) { return $p.Value }
+    return $Default
+}
+
+# NinjaOne returns times in different shapes (ISO-8601 text, Unix seconds, or Unix
+# milliseconds). This converts any of them to Unix milliseconds, or $null if unreadable.
+function ConvertTo-UnixMs {
+    param($Value)
+    if ($null -eq $Value -or "$Value" -eq '') { return $null }
+    if ($Value -is [datetime]) {
+        $utc = $Value.ToUniversalTime()
+        return [DateTimeOffset]::new($utc.Ticks, [TimeSpan]::Zero).ToUnixTimeMilliseconds()
+    }
+    if ($Value -is [DateTimeOffset]) { return $Value.ToUnixTimeMilliseconds() }
+    if ($Value -is [string]) {
+        $dt = [DateTimeOffset]::MinValue
+        if ([DateTimeOffset]::TryParse($Value, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$dt)) {
+            return $dt.ToUnixTimeMilliseconds()
+        }
+        $num = 0.0
+        if (-not [double]::TryParse($Value, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$num)) { return $null }
+        $Value = $num
+    }
+    $n = [double]$Value
+    if ($n -lt 100000000000) { return [long][math]::Round($n * 1000) }   # Unix seconds
+    return [long][math]::Round($n)                                       # Unix milliseconds
+}
+
 # ── Step 1: Authenticate ──────────────────────────────────────────────────────
 Write-Host ""
 Write-Host "  [1/6] Authenticating..." -ForegroundColor Cyan
@@ -165,13 +205,14 @@ Write-Host ""
 Write-Host "  [2/6] Fetching technicians..." -ForegroundColor Cyan
 
 try {
-    $Users = Invoke-NinjaApi -Path 'technicians' -Headers $Headers
-    $Technicians = $Users | Where-Object { $_.userType -eq 'TECHNICIAN' -or $null -eq $_.userType }
-    # Fallback: if userType is absent, treat all users as technicians
-    if (-not $Technicians) { $Technicians = $Users }
+    # GET /v2/users filtered to technicians (returns a plain array, no paging).
+    $Users = @(Invoke-NinjaApi -Path 'users?userType=TECHNICIAN' -Headers $Headers)
+    $Technicians = @($Users | Where-Object { $null -ne $_ -and (Get-Prop $_ 'userType' 'TECHNICIAN') -eq 'TECHNICIAN' })
 } catch {
-    Write-Host "  [!] Failed to fetch technicians: $_" -ForegroundColor Red
-    exit 1
+    # Not fatal: technicians seen in ticket time entries are still reported, by ID.
+    Write-Host "  [!] Could not fetch the technician list: $_" -ForegroundColor Yellow
+    Write-Host "      Continuing - technicians will show as 'Tech <id>' instead of by name." -ForegroundColor Yellow
+    $Technicians = @()
 }
 Write-Host "  [✓] Found $(@($Technicians).Count) technician(s)." -ForegroundColor Green
 
@@ -183,7 +224,7 @@ $AllOrgs = [System.Collections.Generic.List[PSCustomObject]]::new()
 $OrgAfter = 0
 do {
     try {
-        $OrgPage = Invoke-NinjaApi -Path "organizations?pageSize=200&after=$OrgAfter" -Headers $Headers
+        $OrgPage = @(Invoke-NinjaApi -Path "organizations?pageSize=200&after=$OrgAfter" -Headers $Headers)
     } catch {
         Write-Host "  [!] Failed to fetch organizations: $_" -ForegroundColor Red
         exit 1
@@ -204,43 +245,48 @@ Write-Host ""
 Write-Host "  [4/6] Fetching tickets updated in the last $LookbackDays days (paginated)..." -ForegroundColor Cyan
 
 $FromDate  = (Get-Date).AddDays(-$LookbackDays)
-$FromUnix  = [DateTimeOffset]::new($FromDate, [TimeSpan]::Zero).ToUnixTimeMilliseconds()
+$FromUnix  = [DateTimeOffset]::UtcNow.AddDays(-$LookbackDays).ToUnixTimeMilliseconds()
 $NowUnix   = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
 
-$AllTickets   = [System.Collections.Generic.List[PSCustomObject]]::new()
-$LastCursorId = $null
-$StopPaging   = $false
+# Tickets are read from a ticket board (POST ticketing/trigger/board/{id}/run), sorted by
+# last-updated, newest first, so paging can stop once tickets fall outside the window.
+$TicketPageSize = 200
+$AllTickets     = [System.Collections.Generic.List[object]]::new()
+$LastCursorId   = $null
 
 do {
-    $TicketPath = "ticketing/ticket?pageSize=200"
-    if ($LastCursorId) { $TicketPath += "&after=$LastCursorId" }
+    $ReqBody = '{"pageSize":' + $TicketPageSize + ',"sortBy":[{"field":"lastUpdated","direction":"DESC"}]'
+    if ($null -ne $LastCursorId) { $ReqBody += ',"lastCursorId":' + $LastCursorId }
+    $ReqBody += '}'
 
     try {
-        $TicketPage = Invoke-NinjaApi -Path $TicketPath -Headers $Headers
+        $TicketPage = Invoke-NinjaApi -Path "ticketing/trigger/board/$TicketBoardId/run" -Method 'POST' -Headers $Headers -Body $ReqBody
     } catch {
         Write-Host "  [!] Failed to fetch tickets: $_" -ForegroundColor Red
-        Write-Host "      Note: Ticketing must be enabled on your NinjaOne account." -ForegroundColor Yellow
+        Write-Host "      Note: Ticketing must be enabled on your NinjaOne account, and TicketBoardId must be a valid board." -ForegroundColor Yellow
         exit 1
     }
 
-    if (-not $TicketPage -or -not $TicketPage.data -or $TicketPage.data.Count -eq 0) {
-        $StopPaging = $true
-        break
-    }
+    $PageData = @(Get-Prop $TicketPage 'data' @())
+    if ($PageData.Count -eq 0) { break }
+    foreach ($t in $PageData) { $AllTickets.Add($t) }
 
-    foreach ($t in $TicketPage.data) { $AllTickets.Add($t) }
+    # Newest first: once the last ticket on a page is outside the window, stop.
+    $LastOnPage = ConvertTo-UnixMs (Get-Prop $PageData[-1] 'lastUpdated')
+    if ($null -ne $LastOnPage -and $LastOnPage -lt $FromUnix) { break }
 
-    # Stop if the oldest ticket on this page is older than our lookback window
-    $OldestOnPage = $TicketPage.data | Sort-Object lastUpdated | Select-Object -First 1
-    if ($OldestOnPage.lastUpdated -lt $FromUnix) { $StopPaging = $true }
+    $PrevCursorId = $LastCursorId
+    $LastCursorId = Get-Prop (Get-Prop $TicketPage 'metadata' $null) 'lastCursorId' $null
+    if ($null -eq $LastCursorId -or $LastCursorId -eq $PrevCursorId) { break }
+    if ($PageData.Count -lt $TicketPageSize) { break }
+} while ($true)
 
-    $LastCursorId = $TicketPage.metadata.lastCursorId
-    if (-not $LastCursorId) { $StopPaging = $true }
-
-} while (-not $StopPaging)
-
-# Filter to tickets updated within the window
-$FilteredTickets = $AllTickets | Where-Object { $_.lastUpdated -ge $FromUnix }
+# Keep only tickets updated within the window
+$FilteredTickets = [System.Collections.Generic.List[object]]::new()
+foreach ($t in $AllTickets) {
+    $u = ConvertTo-UnixMs (Get-Prop $t 'lastUpdated')
+    if ($null -ne $u -and $u -ge $FromUnix) { $FilteredTickets.Add($t) }
+}
 Write-Host "  [✓] Found $($FilteredTickets.Count) ticket(s) in the date window." -ForegroundColor Green
 
 # ── Step 5: Pull log entries with time tracking ───────────────────────────────
@@ -253,11 +299,12 @@ $TechNameLookup = @{}   # techId -> displayName
 $TechTickets    = @{}   # techId -> count of unique tickets with time
 
 foreach ($tech in $Technicians) {
-    $TechTimeByOrg[$tech.id]  = @{}
-    $TechNameLookup[$tech.id] = if ($tech.name) { $tech.name } `
-                                 elseif ($tech.firstName) { "$($tech.firstName) $($tech.lastName)".Trim() } `
-                                 else { "Tech $($tech.id)" }
-    $TechTickets[$tech.id]    = 0
+    $SeedId = Get-Prop $tech 'id' $null
+    if ($null -eq $SeedId) { continue }
+    $TechTimeByOrg[$SeedId]  = @{}
+    $FullName = ("{0} {1}" -f (Get-Prop $tech 'firstName' ''), (Get-Prop $tech 'lastName' '')).Trim()
+    $TechNameLookup[$SeedId] = if ($FullName) { $FullName } else { "Tech $SeedId" }
+    $TechTickets[$SeedId]    = 0
 }
 
 $Processed  = 0
@@ -269,41 +316,58 @@ foreach ($TicketSummary in $FilteredTickets) {
         Write-Host "    Processing ticket $Processed / $TotalToGet..." -ForegroundColor Gray
     }
 
-    # Only call log-entry API if ticket has tracked time
-    if ($TicketSummary.totalTimeTracked -le 0) { continue }
+    $TicketId = Get-Prop $TicketSummary 'id' $null
+    if ($null -eq $TicketId) { continue }
+
+    # Only call the log-entry API if the ticket has tracked time (seconds; can be null)
+    if ([double](Get-Prop $TicketSummary 'totalTimeTracked' 0) -le 0) { continue }
 
     try {
-        $Logs = Invoke-NinjaApi -Path "ticketing/ticket/$($TicketSummary.id)/log-entry" -Headers $Headers
+        $Logs = @(Invoke-NinjaApi -Path "ticketing/ticket/$TicketId/log-entry" -Headers $Headers)
     } catch {
-        # Non-fatal — skip this ticket's logs
+        # Non-fatal - skip this ticket's logs
         continue
     }
+    if ($Logs.Count -eq 0) { continue }
 
-    if (-not $Logs) { continue }
-
-    $OrgId = $TicketSummary.clientId
+    # Organization: use clientId when the API provides it, otherwise the organization name
+    $OrgNameFromTicket = Get-Prop $TicketSummary 'organization' $null
+    $OrgId = Get-Prop $TicketSummary 'clientId' $null
+    if ($null -eq $OrgId) { $OrgId = if ($OrgNameFromTicket) { $OrgNameFromTicket } else { 'Unknown' } }
+    if (-not $OrgLookup.ContainsKey($OrgId)) {
+        $OrgLookup[$OrgId] = if ($OrgNameFromTicket) { $OrgNameFromTicket } else { "Org $OrgId" }
+    }
 
     foreach ($Log in $Logs) {
-        # Only count TECHNICIAN time entries with time > 0
-        if ($Log.appUserContactType -ne 'TECHNICIAN') { continue }
-        if (-not $Log.timeTracked -or $Log.timeTracked -le 0) { continue }
-        # Filter log entries to the date window
-        if ($Log.createTime -lt $FromUnix -or $Log.createTime -gt $NowUnix) { continue }
+        if ($null -eq $Log) { continue }
 
-        $TechId = $Log.appUserContactId
-        if (-not $TechId) { continue }
+        # Only count TECHNICIAN time entries with time > 0
+        if ((Get-Prop $Log 'appUserContactType' '') -ne 'TECHNICIAN') { continue }
+
+        # Time is reported in minutes (timeTrackedMinutes); older shapes use seconds (timeTracked)
+        $LogMinutes = Get-Prop $Log 'timeTrackedMinutes' $null
+        if ($null -ne $LogMinutes) { $LogSecs = [double]$LogMinutes * 60 }
+        else                       { $LogSecs = [double](Get-Prop $Log 'timeTracked' 0) }
+        if ($LogSecs -le 0) { continue }
+
+        # Filter log entries to the date window
+        $CreatedMs = ConvertTo-UnixMs (Get-Prop $Log 'createTime')
+        if ($null -eq $CreatedMs -or $CreatedMs -lt $FromUnix -or $CreatedMs -gt $NowUnix) { continue }
+
+        $TechId = Get-Prop $Log 'appUserContactId' $null
+        if ($null -eq $TechId) { continue }
 
         # Initialize tech if not yet seen (handles techs not in the user list)
         if (-not $TechTimeByOrg.ContainsKey($TechId)) {
             $TechTimeByOrg[$TechId]  = @{}
-            $TechNameLookup[$TechId] = if ($Log.appUserContactName) { $Log.appUserContactName } else { "Tech $TechId" }
+            $TechNameLookup[$TechId] = "Tech $TechId"
             $TechTickets[$TechId]    = 0
         }
 
         if (-not $TechTimeByOrg[$TechId].ContainsKey($OrgId)) {
             $TechTimeByOrg[$TechId][$OrgId] = 0
         }
-        $TechTimeByOrg[$TechId][$OrgId] += $Log.timeTracked
+        $TechTimeByOrg[$TechId][$OrgId] += $LogSecs
         $TechTickets[$TechId]++
     }
 }
@@ -335,13 +399,15 @@ foreach ($TechId in $TechTimeByOrg.Keys) {
         techName  = $TechNameLookup[$TechId]
         totalHours = [math]::Round($TotalSeconds / 3600, 2)
         ticketCount = $TechTickets[$TechId]
-        orgs      = ($OrgBreakdown | Sort-Object hours -Descending)
+        orgs      = @($OrgBreakdown | Sort-Object hours -Descending)
     })
 }
 
-$ReportData = $ReportData | Sort-Object totalHours -Descending
-$ReportJson = $ReportData | ConvertTo-Json -Depth 5 -Compress
-$GeneratedAt = Get-Date -Format "yyyy-MM-dd HH:mm:ss UTC"
+$ReportData = @($ReportData | Sort-Object totalHours -Descending)
+# -InputObject keeps a single technician as a JSON array (the report script expects an array)
+$ReportJson = if ($ReportData.Count -eq 0) { '[]' } else { ConvertTo-Json -InputObject $ReportData -Depth 5 -Compress }
+$ReportJson = $ReportJson.Replace('</', '<\/')
+$GeneratedAt = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss') + ' UTC'
 $FromDateStr = $FromDate.ToString("yyyy-MM-dd")
 $ToDateStr   = (Get-Date).ToString("yyyy-MM-dd")
 
@@ -349,7 +415,7 @@ $ToDateStr   = (Get-Date).ToString("yyyy-MM-dd")
 Write-Host ""
 Write-Host "  [6/6] Building HTML report and posting to Knowledge Base..." -ForegroundColor Cyan
 
-$Html = @"
+$Html = @'
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -641,18 +707,18 @@ $Html = @"
 <div class="header">
   <div class="header-title">
     <h1>&#128337; Technician Time Report</h1>
-    <p>Generated: $GeneratedAt &nbsp;|&nbsp; Default window: $FromDateStr &rarr; $ToDateStr &nbsp;|&nbsp; Lookback: $LookbackDays days</p>
+    <p>Generated: @@GENERATED_AT@@ &nbsp;|&nbsp; Default window: @@FROM_DATE@@ &rarr; @@TO_DATE@@ &nbsp;|&nbsp; Lookback: @@LOOKBACK_DAYS@@ days</p>
   </div>
 </div>
 
 <div class="controls">
   <div class="control-group">
     <label>From</label>
-    <input type="date" id="filterFrom" value="$FromDateStr">
+    <input type="date" id="filterFrom" value="@@FROM_DATE@@">
   </div>
   <div class="control-group">
     <label>To</label>
-    <input type="date" id="filterTo" value="$ToDateStr">
+    <input type="date" id="filterTo" value="@@TO_DATE@@">
   </div>
   <button class="btn" onclick="applyFilters()">Apply</button>
   <button class="btn btn-ghost" onclick="resetFilters()">Reset</button>
@@ -675,9 +741,9 @@ $Html = @"
 <div class="footer">NinjaOne Technician Time Report &mdash; auto-generated by Invoke-NinjaTimeReport.ps1</div>
 
 <script>
-const RAW_DATA    = $ReportJson;
-const FROM_DEFAULT = '$FromDateStr';
-const TO_DEFAULT   = '$ToDateStr';
+const RAW_DATA    = @@REPORT_JSON@@;
+const FROM_DEFAULT = '@@FROM_DATE@@';
+const TO_DEFAULT   = '@@TO_DATE@@';
 
 function secsToHours(s) { return s; } // data already in hours
 
@@ -826,7 +892,9 @@ renderList(RAW_DATA);
 </script>
 </body>
 </html>
-"@
+'@
+
+$Html = $Html.Replace('@@GENERATED_AT@@', $GeneratedAt).Replace('@@FROM_DATE@@', $FromDateStr).Replace('@@TO_DATE@@', $ToDateStr).Replace('@@LOOKBACK_DAYS@@', [string]$LookbackDays).Replace('@@REPORT_JSON@@', $ReportJson)
 
 # ── Post to NinjaOne Knowledge Base ───────────────────────────────────────────
 # Check if an article with this name already exists in the folder
